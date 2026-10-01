@@ -168,6 +168,11 @@ class MultiAccountBrowserWorker(threading.Thread):
             elif action == "reset":
                 try:
                     for acc in self.accounts:
+                        # Revive accounts paused by the consecutive-error circuit breaker.
+                        if not acc.is_active:
+                            acc.is_active = True
+                            acc.consecutive_errors = 0
+                            logger.info(f"Account #{acc.idx} re-activated by /reset.")
                         acc.reset_chat_session()
                     res_queue.put(("ok", len(self.accounts)))
                 except Exception as e:
@@ -274,7 +279,7 @@ class MultiAccountBrowserWorker(threading.Thread):
                 logger.error(f"Account #{acc.idx} failed: {e}")
                 acc.consecutive_errors += 1
                 if acc.consecutive_errors >= 3:
-                    logger.warning(f"Account #{acc.idx} disabled due to 3 consecutive errors.")
+                    logger.warning(f"Account #{acc.idx} paused due to 3 consecutive errors (auto-resumes on /reset).")
                     acc.is_active = False
                 last_err = e
 
@@ -283,6 +288,16 @@ class MultiAccountBrowserWorker(threading.Thread):
     def _generate_on_page(self, page, prompt):
         textarea = page.locator("textarea").first
         textarea.wait_for(state="visible", timeout=15000)
+
+        # Capture a baseline of assistant text ALREADY on the page. Without this the
+        # extractor matches the previous turn's reply and returns it as if it were the
+        # answer to the current prompt (off-by-one responses).
+        baseline = page.evaluate("""() => {
+            const nodes = document.querySelectorAll('div.prose, div[class*="leading-relaxed"]');
+            return Array.from(nodes).map(n => (n.innerText || "").trim()).filter(Boolean);
+        }""")
+        baseline_set = set(baseline)
+        baseline_count = len(baseline)
 
         textarea.fill(prompt)
         time.sleep(0.1)
@@ -295,31 +310,42 @@ class MultiAccountBrowserWorker(threading.Thread):
         while time.time() - start_time < 90:
             time.sleep(0.5)
 
+            # The Stop control carries aria-label="Stop" and has EMPTY innerText, so
+            # :has-text('Stop') never matches it. Read the attribute instead.
             is_stop_visible = False
             try:
-                stop_btn = page.locator("button:has-text('Stop')").first
-                is_stop_visible = stop_btn.is_visible()
+                stop_btn = page.locator('button[aria-label="Stop"]')
+                is_stop_visible = stop_btn.count() > 0 and stop_btn.first.is_visible()
             except Exception:
                 pass
 
             latest_info = page.evaluate("""() => {
-                const nodes = document.querySelectorAll('div[class*="leading-relaxed"], div[class*="prose"], div[data-message-author-role="assistant"]');
+                const nodes = document.querySelectorAll('div.prose, div[class*="leading-relaxed"]');
                 if (!nodes || nodes.length === 0) return { count: 0, text: "" };
                 const lastNode = nodes[nodes.length - 1];
                 return { count: nodes.length, text: (lastNode.innerText || "").trim() };
             }""")
 
+            cur_count = latest_info.get("count", 0)
             cur_text = latest_info.get("text", "")
 
-            if cur_text:
+            # Accept only content that is genuinely NEW relative to the baseline.
+            is_new = bool(cur_text) and cur_count > baseline_count and cur_text not in baseline_set
+
+            if is_new:
                 if cur_text == last_text:
                     stable_cycles += 1
-                    if not is_stop_visible and stable_cycles >= 2:
+                    finished = (not is_stop_visible) or stable_cycles >= 10
+                    if finished and stable_cycles >= 2:
                         logger.info(f"Response extracted: {len(cur_text)} chars in {time.time() - start_time:.2f}s")
                         return cur_text
                 else:
                     stable_cycles = 0
                     last_text = cur_text
+            else:
+                # Reset so a stale pre-prompt value can never accumulate stability.
+                stable_cycles = 0
+                last_text = ""
 
         raise Exception("Muse.ai did not return response within timeout.")
 
